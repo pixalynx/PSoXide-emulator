@@ -715,6 +715,56 @@ pub struct Cpu {
     /// fault after a cache-control change under a busy DMA channel).
     #[serde(skip)]
     fetch_glitch: Option<u32>,
+    /// Code hooks ([`Cpu::set_code_hooks`]): main RAM words in front of
+    /// which [`Cpu::run`] stops. Host configuration, like the block cache:
+    /// never part of a machine state, so states load the same with or
+    /// without them.
+    #[serde(skip)]
+    code_hooks: Option<Box<CodeHooks>>,
+    /// The hooked PC the last [`Cpu::run`] stopped in front of, until
+    /// [`Cpu::take_code_hook_hit`] takes it.
+    #[serde(skip)]
+    code_hook_hit: Option<u32>,
+    /// The hooked PC reported last: the next run executes it before it can
+    /// stop there again. Dropped when the PC has moved on.
+    #[serde(skip)]
+    code_hook_resume: Option<u32>,
+}
+
+/// One bit per main RAM word (2 MiB / 4): the code hooks.
+#[derive(Clone)]
+struct CodeHooks {
+    bits: Vec<u64>,
+}
+
+impl CodeHooks {
+    const WORDS: usize = memory::ram::SIZE / 4;
+
+    fn new(addrs: &[u32]) -> Self {
+        let mut bits = vec![0u64; Self::WORDS / 64];
+        for &addr in addrs {
+            if let Some(word) = Self::word(addr) {
+                bits[word / 64] |= 1 << (word % 64);
+            }
+        }
+        Self { bits }
+    }
+
+    /// The RAM word of a code address in any segment and mirror, or `None`
+    /// outside main RAM.
+    #[inline(always)]
+    fn word(addr: u32) -> Option<usize> {
+        let phys = memory::to_physical(addr);
+        (phys < memory::ram::MIRROR_END).then(|| (phys as usize % memory::ram::SIZE) / 4)
+    }
+
+    #[inline(always)]
+    fn has(&self, addr: u32) -> bool {
+        match Self::word(addr) {
+            Some(word) => self.bits[word / 64] >> (word % 64) & 1 != 0,
+            None => false,
+        }
+    }
 }
 
 fn block_cache_default() -> bool {
@@ -815,6 +865,9 @@ impl Cpu {
             cursor: Cursor::default(),
             block_cache_enabled: block_cache_default(),
             fetch_glitch: None,
+            code_hooks: None,
+            code_hook_hit: None,
+            code_hook_resume: None,
         }
     }
 
@@ -824,6 +877,80 @@ impl Cpu {
     pub fn set_block_cache_enabled(&mut self, enabled: bool) {
         self.block_cache_enabled = enabled;
         self.cursor = Cursor::default();
+    }
+
+    /// Stop [`Cpu::run`] in front of every instruction at one of `addrs`:
+    /// code addresses in main RAM, in any segment (a hook covers the word in
+    /// every mirror). An empty list removes them all.
+    ///
+    /// A stop is reported by [`Cpu::take_code_hook_hit`]. The next `run`
+    /// from the same PC executes that instruction before it can stop there
+    /// again. The host can instead skip the function with
+    /// [`Cpu::return_from_code_hook`].
+    ///
+    /// No decoded block starts on or holds a hooked word, so the batched
+    /// runs stay batched everywhere else. Results are the same as without
+    /// hooks, as for [`Cpu::set_block_cache_enabled`]. The native tier is
+    /// left out while hooks are set.
+    pub fn set_code_hooks(&mut self, addrs: &[u32]) {
+        self.code_hooks = (!addrs.is_empty()).then(|| Box::new(CodeHooks::new(addrs)));
+        self.code_hook_hit = None;
+        self.code_hook_resume = None;
+        self.blocks.clear();
+        self.cursor = Cursor::default();
+    }
+
+    /// Whether any code hooks are set.
+    pub fn has_code_hooks(&self) -> bool {
+        self.code_hooks.is_some()
+    }
+
+    /// The hooked PC the last [`Cpu::run`] stopped in front of, once.
+    pub fn take_code_hook_hit(&mut self) -> Option<u32> {
+        self.code_hook_hit.take()
+    }
+
+    /// Whether `addr` is a code hook. Used by the block cache.
+    #[inline(always)]
+    pub(crate) fn code_hooked(&self, addr: u32) -> bool {
+        match &self.code_hooks {
+            Some(hooks) => hooks.has(addr),
+            None => false,
+        }
+    }
+
+    /// GPR `index` as the instruction at the PC will read it once the load
+    /// delay has settled: a load in the previous instruction (a call's delay
+    /// slot, say) still waits in the load-delay slot here. A code hook reads
+    /// a function's arguments this way.
+    pub fn settled_gpr(&self, index: u8) -> u32 {
+        match self.pending_load {
+            Some((reg, value)) if reg & 31 == index & 31 && index & 31 != 0 => value,
+            _ => self.gprs[(index & 31) as usize],
+        }
+    }
+
+    /// Return from the function whose first instruction a code hook stopped
+    /// in front of, without running it: the pending load is committed, `v0`
+    /// is set when given, and the PC goes to `$ra`. Only for a stop at a
+    /// function's entry (no branch pending).
+    pub fn return_from_code_hook(&mut self, v0: Option<u32>) {
+        if let Some((reg, value)) = self.pending_load.take() {
+            let i = (reg & 31) as usize;
+            if i != 0 {
+                self.gprs[i] = value;
+            }
+        }
+        self.committing_load = None;
+        self.load_shadow = None;
+        if let Some(value) = v0 {
+            self.gprs[2] = value;
+        }
+        self.pc = self.gprs[31];
+        self.pending_pc = None;
+        self.branch_delay_next = false;
+        self.cursor = Cursor::default();
+        self.code_hook_resume = None;
     }
 
     /// Blocks decoded so far (built or rebuilt). Diagnostic.
@@ -1812,7 +1939,23 @@ impl Cpu {
         // The batch that just ran ended at the clock limit: another started
         // now would run nothing, so the step comes first.
         let mut after_limit = false;
+        // A hook reported last time only lets its own instruction through.
+        if self.code_hook_resume.is_some_and(|pc| pc != self.pc) {
+            self.code_hook_resume = None;
+        }
         while steps < max_steps {
+            // Code hooks: stop in front of a hooked instruction. Blocks never
+            // start on or hold one (`enter_block`, `build_block`), so every
+            // hooked PC passes through here.
+            if self.code_hooks.is_some() && self.code_hooked(self.pc) {
+                if self.code_hook_resume == Some(self.pc) {
+                    self.code_hook_resume = None;
+                } else {
+                    self.code_hook_hit = Some(self.pc);
+                    self.code_hook_resume = Some(self.pc);
+                    break;
+                }
+            }
             // A waiting HLE call retried with nothing else happening is
             // charged without re-running the call; same instructions, same
             // cycles, same stop point (see `skip_hle_wait_stepwise`).

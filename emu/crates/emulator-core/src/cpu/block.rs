@@ -646,6 +646,11 @@ impl Cpu {
         if phys >= memory::ram::MIRROR_END {
             return false;
         }
+        // A code hook (`Cpu::set_code_hooks`): `Cpu::run` must see the PC
+        // arrive there, so the hooked op runs alone through the interpreter.
+        if self.code_hooked(pc) {
+            return false;
+        }
         // The HLE kernel area: the interpreter looks for its hooks (the
         // A0/B0/C0 vectors, the exception-return stub, trap words in RAM)
         // before every fetch there. A block never starts on a hook nor holds
@@ -955,6 +960,11 @@ impl Cpu {
         let word_at = |cpu: &Cpu, i: usize| -> Option<u32> {
             let phys = base.wrapping_add(4 * i as u32);
             if phys / RAM_BYTES != base / RAM_BYTES {
+                return None;
+            }
+            // A block ends in front of a code hook, so that the hooked word
+            // can only be reached as a block entry (refused) or by a step.
+            if i != 0 && cpu.code_hooked(phys) {
                 return None;
             }
             let word = cpu.instruction_cache.hit(phys)?;
@@ -1332,7 +1342,9 @@ impl Cpu {
     /// Callers must not need to look at the machine between these steps.
     #[inline(never)]
     pub(super) fn run_fast(&mut self, bus: &mut Bus, budget: u64, until_cycle: u64) -> u64 {
-        if self.blocks.compiler.is_some() {
+        // The native tier knows nothing of code hooks: leave it out while
+        // any are set.
+        if self.blocks.compiler.is_some() && !self.has_code_hooks() {
             return self.run_tiered(bus, budget, until_cycle);
         }
         if self.cursor.block == 0 || self.cursor.pc != self.pc {
@@ -2107,6 +2119,83 @@ mod tests {
                 "bus differs, chunk {chunk}"
             );
         }
+    }
+
+    /// Code hooks: `Cpu::run` stops in front of every arrival at a hooked
+    /// address (a call target, a branch target, a jump target, straight-line
+    /// code after a store, a call's delay slot), and a run that resumes after
+    /// each stop leaves the same machine as the plain interpreter.
+    #[test]
+    fn code_hooks_stop_at_every_arrival_and_change_nothing() {
+        let hooked = [
+            0x8001_0060,
+            0x8001_000c,
+            0x8001_0008,
+            0x8001_0014,
+            0x8001_0028,
+        ];
+        let (mut plain, mut plain_bus) = machine(false);
+        let mut arrivals = [0u64; 5];
+        for _ in 0..60_000 {
+            if let Some(k) = hooked.iter().position(|&a| a == plain.pc()) {
+                arrivals[k] += 1;
+            }
+            plain.step(&mut plain_bus).expect("step");
+        }
+        assert!(arrivals.iter().all(|&n| n >= 10), "{arrivals:?}");
+        for chunk in [1u64, 17, 60_000] {
+            let (mut cpu, mut bus) = machine(true);
+            cpu.set_code_hooks(&hooked);
+            let mut hits = [0u64; 5];
+            let mut done = 0;
+            while done < 60_000 {
+                let (ran, result) =
+                    cpu.run(&mut bus, chunk.min(60_000 - done), u64::MAX, |_| false);
+                result.expect("run");
+                done += ran;
+                if let Some(pc) = cpu.take_code_hook_hit() {
+                    assert_eq!(pc, cpu.pc());
+                    hits[hooked.iter().position(|&a| a == pc).expect("a hooked pc")] += 1;
+                }
+            }
+            assert!(cpu.blocks_built() > 0, "chunk {chunk}: no blocks were used");
+            assert_eq!(hits, arrivals, "chunk {chunk}: stops vs arrivals");
+            assert_eq!(digest(&cpu), digest(&plain), "CPU differs, chunk {chunk}");
+            assert_eq!(
+                digest(&bus),
+                digest(&plain_bus),
+                "bus differs, chunk {chunk}"
+            );
+        }
+    }
+
+    /// `Cpu::return_from_code_hook` skips the hooked function: the PC goes
+    /// to `$ra` with `v0` set, and the run carries on from there.
+    #[test]
+    fn code_hook_return_skips_the_function() {
+        let (mut cpu, mut bus) = machine(true);
+        cpu.set_code_hooks(&[0x8001_0060]);
+        let mut returns = 0;
+        let mut done = 0;
+        while done < 20_000 {
+            let (ran, result) = cpu.run(&mut bus, 20_000 - done, u64::MAX, |_| false);
+            result.expect("run");
+            done += ran;
+            if let Some(pc) = cpu.take_code_hook_hit() {
+                assert_eq!(pc, 0x8001_0060);
+                assert_eq!(cpu.settled_gpr(31), 0x8001_002c);
+                cpu.return_from_code_hook(Some(0x1234));
+                assert_eq!(cpu.pc(), 0x8001_002c);
+                assert_eq!(cpu.gpr(2), 0x1234);
+                returns += 1;
+            }
+        }
+        assert!(returns > 100, "{returns}");
+        // With the call skipped the loop still ran to its end and on into the
+        // overflow trap.
+        assert!(cpu.exception_counts()[12] >= 1);
+        cpu.set_code_hooks(&[]);
+        assert!(!cpu.has_code_hooks());
     }
 
     /// `until_cycle` stops on the same instruction as checking the clock
